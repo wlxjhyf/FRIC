@@ -210,6 +210,8 @@ class fric_LlamaModel(fric_LlamaPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
+        if use_cache and type(past_key_values) is tuple:
+            past_key_values = DynamicCache(config=self.config).from_legacy_cache(past_key_values)
 
 
         if cache_position is None:
