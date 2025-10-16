@@ -199,36 +199,13 @@ def default_pb_stop_parameters(max_new_tokens=100):
         stop_sequences=[], max_new_tokens=max_new_tokens
     )
 
-def defatult_multi_batch_pb(batches, mode):
-    questions = [
-        "What is Deep Learning?",
-    ] * batches
-    question_length = [5] * batches
-
-    if mode == "chat":
-        questions = [llama_chat_wrapper(question + ". " * max(0, CONTEXT_LEN - qlen - 27)) for qlen, question in zip(question_length, questions)]
-
-    requests = []
-    for i in range(batches):
-        requests.append(
-            generate_pb2.Request(
-                id=i,
-                inputs=questions[i],
-                input_chunks=generate_pb2.Input(
-                    chunks=[generate_pb2.InputChunk(text=questions[i])]
-                ),
-                prefill_logprobs=False,
-                truncate=CONTEXT_LEN + 50,
-                parameters=default_pb_parameters(),
-                stopping_parameters=default_pb_stop_parameters(DECODE_TOKEN_LEN),
-            )
-        )
-    batch_pb = generate_pb2.Batch(id=1, requests=requests, size=batches)
-    return batch_pb
 
 
 DECODE_TOKEN_LEN = soph_config.DECODE_TOKEN_LEN
-CONTEXT_LEN = soph_config.CONTEXT_LEN
+# CONTEXT_LEN = soph_config.CONTEXT_LEN
+CONTEXT_LEN = 200
+TEST_LEN = 50
+
 batches = 1
 chat_token_num = 27
 mode="chat"
@@ -258,15 +235,104 @@ cache_manager = model.init_kv_cache(
 )
 
 
+
+def show(times, label="Time"):
+    times = np.array(times)
+    worst = np.max(times)
+    best = np.min(times)
+    percentile_50 = np.percentile(times, 50)
+    mean = np.mean(times)
+    print(f"{label}:")
+    print(f"  Best      : {best / 1_000_000:.3f} ms")
+    print(f"  50% perc  : {percentile_50 / 1_000_000:.3f} ms")
+    print(f"  Mean      : {mean / 1_000_000:.3f} ms")
+    print(f"  Worst     : {worst / 1_000_000:.3f} ms")
+    print("")
+
+
+def default_multi_batch_pb(batches, mode):
+    questions = [
+        "What is Deep Learning?I am new to this field. Please explain it with examples.",
+    ] * batches
+    question_length = [len(model.tokenizer.encode(q)) for q in questions]
+
+    if mode == "chat":
+        questions = [llama_chat_wrapper(question + ". " * max(0, CONTEXT_LEN - qlen - 27)) for qlen, question in zip(question_length, questions)]
+
+    requests = []
+    for i in range(batches):
+        requests.append(
+            generate_pb2.Request(
+                id=i,
+                inputs=questions[i],
+                input_chunks=generate_pb2.Input(
+                    chunks=[generate_pb2.InputChunk(text=questions[i])]
+                ),
+                prefill_logprobs=False,
+                truncate=CONTEXT_LEN + 50,
+                parameters=default_pb_parameters(),
+                stopping_parameters=default_pb_stop_parameters(DECODE_TOKEN_LEN),
+            )
+        )
+    batch_pb = generate_pb2.Batch(id=1, requests=requests, size=batches)
+    return batch_pb
+
+
+raw = open("/data/calibration_data_v5_rc.txt").read()
+raw_tokens = raw
+
+def input_prepare(batches = 1):
+    a = 0
+    nums = 0
+    while a + CONTEXT_LEN < len(raw_tokens) and nums < TEST_LEN:
+        nums += 1
+        batch_src = raw_tokens[a : a + CTX_LEN]
+        a += CTX_LEN
+        questions = [
+            batch_src,
+        ] * batches
+        question_length = [len(model.tokenizer.encode(q)) for q in questions]
+
+        questions = [llama_chat_wrapper(question + ". " * max(0, CONTEXT_LEN - qlen - 27)) for qlen, question in zip(question_length, questions)]
+
+        requests = []
+        for i in range(batches):
+            requests.append(
+                generate_pb2.Request(
+                    id=i,
+                    inputs=questions[i],
+                    input_chunks=generate_pb2.Input(
+                        chunks=[generate_pb2.InputChunk(text=questions[i])]
+                    ),
+                    prefill_logprobs=False,
+                    truncate=CONTEXT_LEN + 50,
+                    parameters=default_pb_parameters(),
+                    stopping_parameters=default_pb_stop_parameters(DECODE_TOKEN_LEN),
+                )
+            )
+        batch_pb = generate_pb2.Batch(id=1, requests=requests, size=batches)
+        next_batch = FlashCausalLMBatch.from_pb(
+            batch_pb, model.tokenizer, model.dtype, model.device
+        )
+        yield next_batch
+
+
+
 def model_run():
     time_list = []
     generated_text = {}
+
+    batch_pb = default_multi_batch_pb(batches, mode)
+    next_batch = FlashCausalLMBatch.from_pb(
+        batch_pb, model.tokenizer, model.dtype, model.device
+    )
+
     for i in range(DECODE_TOKEN_LEN):
         os.environ["TOKEN_IDX"] = str(i)
 
         generate_start = time.time_ns()
         generations, next_batch, (forward_ns, decode_ns) = model.generate_token(
-                next_batch
+            next_batch
         )
         generate_end = time.time_ns()
         
@@ -287,6 +353,55 @@ def model_run():
         print(f"FTL: {time_list[0] / 1000**2:.1f}ms, TPS: {batches / np.mean(time_list[1:]) * 1000**3:.1f}")
         print(f'TTFT: {time_list[0] /1000**3:.3f}s, TPOT: {np.mean(time_list[1:]) /1000**3:.3f}s, Throughput: {batches / np.mean(time_list[1:]) *1000**3:.1f}, TPS: {1/ np.mean(time_list[1:]) *1000**3:.1f}')
 
+prefill_times = []
+deocde_times = []
+
+
+def prefill_benchmark():
+    global prefill_times
+
+    for next_batch in input_prepare():
+        os.environ["TOKEN_IDX"] = str(0)
+
+        generate_start = time.time_ns()
+        _, _, _ = model.generate_token(
+            next_batch
+        )
+        generate_end = time.time_ns()
+        
+        prefill_times.append(generate_end - generate_start)
+
+    show(prefill_times)
+
+
+def decode_benchmark():
+    global deocde_times
+
+    batch_pb = default_multi_batch_pb(batches, mode)
+    next_batch = FlashCausalLMBatch.from_pb(
+        batch_pb, model.tokenizer, model.dtype, model.device
+    )
+    _, next_batch, _ = model.generate_token(
+        next_batch
+    )
+
+    for i in range(1, TEST_LEN):
+        os.environ["TOKEN_IDX"] = str(i)
+
+        generate_start = time.time_ns()
+        _, _, _ = model.generate_token(
+            next_batch
+        )
+        generate_end = time.time_ns()
+        
+        deocde_times.append(generate_end - generate_start)
+
+    
+    show(deocde_times)
+
+
 
 if __name__ == "__main__":
-    model_run()
+    #model_run()
+    prefill_benchmark()
+    decode_benchmark()
