@@ -83,19 +83,6 @@ def model_run():
     response_ids = torch.cat([input_ids, torch.tensor(generated_tokens, device=input_ids.device).unsqueeze(0)], dim=1)
     print(tokenizer.decode(response_ids[0], skip_special_tokens=True))
 
-def show(times, label="Time"):
-    times = np.array(times)
-    worst = np.max(times)
-    best = np.min(times)
-    percentile_50 = np.percentile(times, 50)
-    mean = np.mean(times)
-    print(f"{label}:")
-    print(f"  Best      : {best * 1000:.3f} ms")
-    print(f"  50% perc  : {percentile_50 * 1000:.3f} ms")
-    print(f"  Mean      : {mean * 1000:.3f} ms")
-    print(f"  Worst     : {worst * 1000:.3f} ms")
-    print("")
-
 def input_prepare(batch_size=1):
     a = 0
     nums = 0
@@ -137,100 +124,62 @@ def input_prepare(batch_size=1):
             ).to(model.device)
             yield input_ids
 
+def prefill_profiler():
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/prefill'),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        with_modules=True,
+    ) as prof:
+        for input_ids in input_prepare(batch_size=1):
+            for i in range(5):
+                print(f"Step {i}")
+                _ = model(input_ids=input_ids, use_cache=True)
+                model.model.fric_offloader.offset = [0] * model.model.fric_offloader.num_layers
+                prof.step()
+            break
 
-def prefill_benchmark(batch_size=1):
-    a = 0
-    nums = 0
-    for input_ids in input_prepare(batch_size):
-        with torch.inference_mode():
-            torch.cuda.synchronize()
-            t00 = time.perf_counter()
-            outputs = model(input_ids=input_ids, use_cache=True)
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            prefill_times.append(t1 - t00)
 
-        model.model.fric_offloader.offset = [0] * model.model.fric_offloader.num_layers
-    show(prefill_times, "Prefill Time")
-
-def decode_benchmark(batch_size=1):
-    gen = input_prepare(batch_size)
-    input_ids = next(gen)
-    outputs = model(input_ids=input_ids, use_cache=True)
-    logits = outputs.logits
-    next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(1)
-    past_key_values = outputs.past_key_values
-
-    LENGTH_PER_TRIAL = 100
-    for _ in range(LENGTH_PER_TRIAL):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        outputs = model(
-            input_ids=next_token,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        decode_times.append(t1 - t0)
-        # logits = outputs.logits
-        # past_key_values = outputs.past_key_values
-        # next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(1)
-    show(decode_times, "Decode Time")
-        
-def resume_test():
-    next_token = input_ids
-    past_key_values = None
-    LENGTH_PER_TRIAL1 = 10
-    for _ in range(LENGTH_PER_TRIAL1):
-        outputs = model(
-            input_ids=next_token,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
+def decode_profiler():
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/decode'),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        with_modules=True,
+    ) as prof:
+        gen = input_prepare(batch_size=1)
+        input_ids = next(gen)
+        outputs = model(input_ids=input_ids, use_cache=True)
         logits = outputs.logits
-        past_key_values = outputs.past_key_values
         next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(1)
-        generated_tokens.append(next_token.item())
-        model.model.fric_offloader.set_last_token_id(next_token)
-    
-    print("--RESUME TEST: STOP! tokens generated before the resume are below!--")
-    response_ids = torch.cat([input_ids, torch.tensor(generated_tokens, device=input_ids.device).unsqueeze(0)], dim=1)
-    print(tokenizer.decode(response_ids[0], skip_special_tokens=True))
-    generated_tokens.clear()
-    
-    print("--RESUME TEST: CONTINUE! tokens generated after the resume are below!--")
-
-    past_key_values = model.model.fric_offloader.sync_restore()
-
-    LENGTH_PER_TRIAL2 = 47
-    for _ in range(LENGTH_PER_TRIAL2):
-        outputs = model(
-            input_ids=next_token,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-        logits = outputs.logits
         past_key_values = outputs.past_key_values
-        next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(1)
-        generated_tokens.append(next_token.item())
 
-    response_ids = torch.tensor(generated_tokens, device=input_ids.device).unsqueeze(0)
-    print(tokenizer.decode(response_ids[0], skip_special_tokens=True))
+        for i in range(5):
+            print(f"Step {i}")
+            outputs = model(
+                input_ids=next_token,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            logits = outputs.logits
+            past_key_values = outputs.past_key_values
+            next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(1)
+            prof.step()
 
 
 
 if __name__ == "__main__":
-    # model_run()
-
-    # prefill_benchmark(1)
-    decode_benchmark(4)
-
-    # show(prefill_times, "Prefill Time")
-    # show(decode_times, "Decode Time")
-
-    # if os.environ.get('FRIC_OFFLOAD') == '1':
-    #     model.model.fric_offloader.show()
-
-    # print(model)
-    # resume_test()
+    # prefill_profiler()
+    decode_profiler()

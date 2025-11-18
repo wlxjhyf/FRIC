@@ -42,12 +42,10 @@ class fric_offloader:
 
         with torch.cuda.stream(self.copy_stream):
             self.copy_stream.wait_event(event)
-            k_buf = self.k_buf[layer_idx][:B, :H, offset:offset+T, :]
-            v_buf = self.v_buf[layer_idx][:B, :H, offset:offset+T, :]
-            k_buf.copy_(k, non_blocking=True)
-            v_buf.copy_(v, non_blocking=True)
-            # k_buf1 = k.to(k_buf, non_blocking=True)
-            # v_buf1 = v.to(v_buf, non_blocking=True)
+            k_buf = self.k_buf[layer_idx][:B, :H, offset:offset+T, :].contiguous()
+            v_buf = self.v_buf[layer_idx][:B, :H, offset:offset+T, :].contiguous()
+            k_buf = k.to(k_buf, non_blocking=True)
+            v_buf = v.to(v_buf, non_blocking=True)
 
         self.offset[layer_idx] += T
         return k_buf, v_buf
