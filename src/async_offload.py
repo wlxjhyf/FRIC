@@ -1,5 +1,6 @@
 import torch
-
+from arch.riscv.io_urings import __make_iov, submit
+from arch.riscv.ssd_blocks import blocks_prepare
 
 class fric_offloader:
     """
@@ -18,7 +19,23 @@ class fric_offloader:
         self.k_buf = [torch.empty((max_batch_size, num_heads, max_seq_len, head_dim), device='cpu', pin_memory=True) for _ in range(num_layers)]
         self.v_buf = [torch.empty((max_batch_size, num_heads, max_seq_len, head_dim), device='cpu', pin_memory=True) for _ in range(num_layers)]
         self.offset = [0] * num_layers
+        self.fds = blocks_prepare()
 
+    # def buffer_slice(self, tensor, batch, head, tokens):
+    #     base_ptr = tensor.data_ptr()
+    #     elem_size = tensor.element_size()
+        
+    #     offset_elems = (
+    #         batch * self.num_heads * self.max_seq_len * self.head_dim +
+    #         head  * self.max_seq_len * self.head_dim
+    #     )
+
+    #     offset_bytes = offset_elems * elem_size
+    #     write_ptr = base_ptr + offset_bytes
+
+    #     length = tokens * self.head_dim * elem_size
+    #     iov = __make_iov(write_ptr, length)
+    #     return iov
 
     def async_offload(self, layer_idx, k:torch.tensor, v:torch.tensor, event:torch.cuda.Event = None):
         """
@@ -42,12 +59,16 @@ class fric_offloader:
 
         with torch.cuda.stream(self.copy_stream):
             self.copy_stream.wait_event(event)
-            k_buf = self.k_buf[layer_idx][:B, :H, offset:offset+T, :].contiguous()
-            v_buf = self.v_buf[layer_idx][:B, :H, offset:offset+T, :].contiguous()
+            k_buf = self.k_buf[layer_idx][:B, :H, offset:offset+T, :]
+            v_buf = self.v_buf[layer_idx][:B, :H, offset:offset+T, :]
             k_buf = k.to(k_buf, non_blocking=True)
-            v_buf = v.to(v_buf, non_blocking=True)
+            v_buf = v.to(v_buf, non_blocking=True) 
 
         self.offset[layer_idx] += T
+        # k_iov = self.buffer_slice(k_buf, B, H, T)
+        # v_iov = self.buffer_slice(v_buf, B, H, T)
+
+        submit(self.fds, k_buf, v_buf, seq=0, layer=layer_idx, token=T)
         return k_buf, v_buf
 
     def sync_restore_each_layer(self, layer_idx):
