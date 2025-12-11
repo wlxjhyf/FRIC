@@ -6,11 +6,11 @@ import time
 import numpy as np
 import sys
 
-os.environ['FRIC_OFFLOAD'] = '1'
+# os.environ['FRIC_OFFLOAD'] = '1'
 
 ###############################################
 
-model_id = "/home/xujiahao/fric/model"
+model_id = "/mnt/data/xujiahao/FRIC/model"
 
 device = sys.argv[1] if len(sys.argv) > 1 else "cuda"
 CTX_LEN = int(sys.argv[2]) if len(sys.argv) > 2 else 32
@@ -20,10 +20,10 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 tokenizer.pad_token = tokenizer.eos_token
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
-    dtype=torch.bfloat16,
+    dtype=torch.float16,
 ).to(device)
 
-raw = open("/home/xujiahao/rwkv/benchmark/eval/calibration_data_v5_rc.txt").read()
+raw = open("/mnt/data/xujiahao/FRIC/calibration_data_v5_rc.txt").read()
 tokens = tokenizer.encode(raw)
 
 messages = [
@@ -88,11 +88,13 @@ def show(times, label="Time"):
     worst = np.max(times)
     best = np.min(times)
     percentile_50 = np.percentile(times, 50)
+    percentile_90 = np.percentile(times, 90)
     mean = np.mean(times)
     print(f"{label}:")
     print(f"  Best      : {best * 1000:.3f} ms")
     print(f"  50% perc  : {percentile_50 * 1000:.3f} ms")
     print(f"  Mean      : {mean * 1000:.3f} ms")
+    print(f"  90% perc  : {percentile_90 * 1000:.3f} ms")
     print(f"  Worst     : {worst * 1000:.3f} ms")
     print("")
 
@@ -154,32 +156,34 @@ def prefill_benchmark(batch_size=1):
             if is_first_time is True:
                 print(f"the prefill tokens' number is {outputs.past_key_values[0][0].shape[2]}")
                 is_first_time = False
-        model.model.fric_offloader.offset = 0
+        model.model.fric_offloader.offset = [0] * model.model.fric_offloader.num_layers
+    show(prefill_times, "prefill time")
+    # model.model.fric_offloader.mmap_to_pagecache()
+
 
 def decode_benchmark(batch_size=1):
-    gen = input_prepare(batch_size)
+    gen = input_prepare(1)
     input_ids = next(gen)
     outputs = model(input_ids=input_ids, use_cache=True)
     logits = outputs.logits
     next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(1)
-    past_key_values = outputs.past_key_values
-    print(type(past_key_values))
+    # past_key_values = outputs.past_key_values
+    next_token = next_token.repeat(batch_size, 1)
+    print(next_token.shape)
 
-    LENGTH_PER_TRIAL = 1
+    LENGTH_PER_TRIAL = 20
     for _ in range(LENGTH_PER_TRIAL):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         outputs = model(
             input_ids=next_token,
-            past_key_values=past_key_values,
             use_cache=True,
         )
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         decode_times.append(t1 - t0)
-        logits = outputs.logits
-        past_key_values = outputs.past_key_values
-        next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(1)
+
+    show(decode_times, "decode time")
         
 def resume_test():
     next_token = input_ids
@@ -221,19 +225,43 @@ def resume_test():
     response_ids = torch.tensor(generated_tokens, device=input_ids.device).unsqueeze(0)
     print(tokenizer.decode(response_ids[0], skip_special_tokens=True))
 
+def test_dtype_tansfer():
+    for input_ids in input_prepare(1):
+        outputs = model(input_ids=input_ids, use_cache=True)
+        global is_first_time
+        if is_first_time is True:
+            print(f"the prefill tokens' number is {outputs.past_key_values[0][0].shape[2]}")
+            is_first_time = False
+            break
+    print(model.model.fric_offloader.offset)
+    pkv = model.model.fric_offloader.sync_restore_cpu(dtype=torch.bfloat16)
+    print(pkv[0][0].shape)
+
+
+
+    t0 = time.perf_counter()
+    model.model.fric_offloader.sync_restore_cpu(dtype=torch.bfloat16)
+    t1 = time.perf_counter()
+
+    t2 = time.perf_counter()
+    model.model.fric_offloader.sync_restore_cpu(dtype=torch.float32)
+    t3 = time.perf_counter()
+
+    print(f"FRIC sync restore CPU bfloat16 time: {(t1 - t0)*1000:.3f} ms")
+    print(f"FRIC sync restore CPU float32 time: {(t3 - t2)*1000:.3f} ms")
+
 
 
 if __name__ == "__main__":
     # model_run()
 
-    # prefill_benchmark(1)
-    # decode_benchmark(1)
-
-    # show(prefill_times, "Prefill Time")
-    # show(decode_times, "Decode Time")
+    prefill_benchmark(1)
+    # decode_benchmark(512)
 
     # if os.environ.get('FRIC_OFFLOAD') == '1':
     #     model.model.fric_offloader.show()
 
     # print(model)
-    resume_test()
+    # resume_test()
+
+    # test_dtype_tansfer()
