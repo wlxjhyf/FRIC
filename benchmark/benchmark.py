@@ -10,7 +10,7 @@ import sys
 
 ###############################################
 
-model_id = "/home/jingzhe/xujiahao/FRIC/model"
+model_id = "/mnt/data/xujiahao/FRIC/model"
 
 device = sys.argv[1] if len(sys.argv) > 1 else "cuda"
 CTX_LEN = int(sys.argv[2]) if len(sys.argv) > 2 else 32
@@ -23,7 +23,7 @@ model = AutoModelForCausalLM.from_pretrained(
     dtype=torch.bfloat16,
 ).to(device)
 
-raw = open("/home/jingzhe/xujiahao/FRIC/calibration_data_v5_rc.txt").read()
+raw = open("/mnt/data/xujiahao/FRIC/calibration_data_v5_rc.txt").read()
 tokens = tokenizer.encode(raw)
 
 messages = [
@@ -223,8 +223,8 @@ def resume_test():
 if __name__ == "__main__":
     # model_run()
 
-    # prefill_benchmark(1)
-    decode_benchmark(4)
+    prefill_benchmark(1)
+    # decode_benchmark(4)
 
     # show(prefill_times, "Prefill Time")
     # show(decode_times, "Decode Time")
