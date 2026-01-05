@@ -67,14 +67,15 @@ class IOEntry:
 
 
 
+
 @dataclass(frozen=True)
 class FRIC_SSD_LogEntry:
     """
     Log entry
 
-    W[m, n] : allocate and write blocks [m, m+n)
-    P[m, s, l] : partial append to block m
-    F[m, n] : free blocks [m, m+n)
+    A[n, b] : allocate n blocks for logical block range [b, b+n)
+    P[m, s, l] : partial write to logical block m, range [s, s+l)
+    F[m, n] : flip validity of logical block range [m, m+n)
     """
     op: str
     args: Tuple
@@ -104,27 +105,29 @@ class FRIC_SSD_Log:
 
     # ---------- Log operations ----------
 
-    def log_write(self, start: int, count: int) -> int:
+    def log_alloc(self, n: int, base: int) -> int:
         """
-        W[m, n]
+        A[n, b]
+        allocate n blocks for logical block range [b, b+n)
         """
-        entry = FRIC_SSD_LogEntry('W', (start, count))
+        entry = FRIC_SSD_LogEntry('A', (n, base))
         return self._append_and_commit(entry)
 
     def log_partial(self, block: int, offset: int, length: int) -> int:
         """
         P[m, s, l]
+        partial write to logical block m
         """
         entry = FRIC_SSD_LogEntry('P', (block, offset, length))
         return self._append_and_commit(entry)
 
-    def log_free(self, start: int, count: int) -> int:
+    def log_flip(self, start: int, count: int) -> int:
         """
         F[m, n]
+        flip validity of logical block range [m, m+n)
         """
         entry = FRIC_SSD_LogEntry('F', (start, count))
         return self._append_and_commit(entry)
-
     # ---------- Recovery ----------
 
     def replay(self):

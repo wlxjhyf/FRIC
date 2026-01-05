@@ -69,6 +69,18 @@ class BlockPool:
         with self._lock:
             return len(self._free)
 
+
+class block_holder:
+    def __init__(self):
+        self.ptr = -1
+        self.capacity = 2
+        self.pblocks = []
+    
+    def get_pblock(self, pblock):
+        self.ptr += 1
+        self.ptr = self.ptr % self.capacity
+        self.pblocks[self.ptr] = pblock
+
 class BlockBinding:
     def __init__(self, block_pool: BlockPool):
         """
@@ -82,6 +94,7 @@ class BlockBinding:
     def alloc(self) -> int:
         """
         分配一个新的虚拟块号
+        虚拟块号是index，对应pblock
         return: vblock
         """
         block = self.block_pool.alloc()

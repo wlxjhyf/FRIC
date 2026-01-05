@@ -18,6 +18,7 @@ from liburing import (
 import threading
 import ctypes
 import time
+import queue
 
 ENTRIES = 64 
 
@@ -53,11 +54,41 @@ class fric_offloader:
         self.kv_index_table = KVIndexTable()
         self.ring = io_uring()
         io_uring_queue_init(ENTRIES, self.ring, 0)
+        self.offload_queue = queue.Queue(maxsize=128) 
         self._start_cqe_worker()
+        self._start_submit_worker()
         self.io_entries = {}
 
     def _start_cqe_worker(self):
         t = threading.Thread(target=self._cqe_worker, daemon=True)
+        t.start()
+    
+    def _submit_worker(self):
+        while True:
+            task = self.offload_queue.get()
+            if task is None:
+                break   
+
+            k_buf, v_buf, seq, layer, token = task
+
+            try:
+                self.submit(
+                    k_buf,
+                    v_buf,
+                    seq=seq,
+                    layer=layer,
+                    token=token
+                )
+            except Exception as e:
+                print(f"[FRIC submit worker error] {e}")
+
+            self.offload_queue.task_done()
+
+    def _start_submit_worker(self):
+        t = threading.Thread(
+            target=self._submit_worker,
+            daemon=True
+        )
         t.start()
 
     def _cqe_worker(self):
@@ -94,7 +125,11 @@ class fric_offloader:
                         io_entry.end_offset - io_entry.start_offset
                     )
                 else:
-                    self.log.log_write(
+                    self.log.log_alloc(
+                        io_entry.start_idx,
+                        io_entry.end_idx - io_entry.start_idx
+                    )
+                    self.log.log_flip(
                         io_entry.start_idx,
                         io_entry.end_idx - io_entry.start_idx
                     )
@@ -208,7 +243,10 @@ class fric_offloader:
         # k_iov = self.buffer_slice(k_buf, B, H, T)
         # v_iov = self.buffer_slice(v_buf, B, H, T)
 
-        self.submit(k_buf, v_buf, seq=0, layer=layer_idx, token=T)
+        # self.submit(k_buf, v_buf, seq=0, layer=layer_idx, token=T)
+        self.offload_queue.put(
+            (k_buf, v_buf, 0, layer_idx, T)
+        )
         return k_buf, v_buf
 
     def sync_restore_each_layer(self, layer_idx):
