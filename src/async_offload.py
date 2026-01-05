@@ -97,7 +97,7 @@ class fric_offloader:
         while True:
             ret = io_uring_peek_cqe(self.ring, cqe)
             if ret < 0:
-                time.sleep(0.1)
+                time.sleep(0.001)
                 continue
             
             io_entry_idx = cqe.user_data
