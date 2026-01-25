@@ -89,11 +89,11 @@ def show(times, label="Time"):
     best = np.min(times)
     percentile_50 = np.percentile(times, 50)
     percentile_90 = np.percentile(times, 90)
-    mean = np.mean(times)
+    # mean = np.mean(times)
     print(f"{label}:")
     print(f"  Best      : {best * 1000:.3f} ms")
     print(f"  50% perc  : {percentile_50 * 1000:.3f} ms")
-    print(f"  Mean      : {mean * 1000:.3f} ms")
+    # print(f"  Mean      : {mean * 1000:.3f} ms")
     print(f"  90% perc  : {percentile_90 * 1000:.3f} ms")
     print(f"  Worst     : {worst * 1000:.3f} ms")
     print("")
@@ -171,7 +171,7 @@ def decode_benchmark(batch_size=1):
     next_token = next_token.repeat(batch_size, 1)
     print(next_token.shape)
 
-    LENGTH_PER_TRIAL = 20
+    LENGTH_PER_TRIAL = 50
     for _ in range(LENGTH_PER_TRIAL):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -256,7 +256,7 @@ if __name__ == "__main__":
     # model_run()
 
     prefill_benchmark(1)
-    # decode_benchmark(512)
+    # decode_benchmark(1)
 
     # if os.environ.get('FRIC_OFFLOAD') == '1':
     #     model.model.fric_offloader.show()

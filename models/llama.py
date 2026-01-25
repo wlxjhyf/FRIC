@@ -73,7 +73,7 @@ class fric_LlamaAttention(nn.Module):
         if os.environ.get('FRIC_OFFLOAD') == '1':
             event = torch.cuda.Event()
             event.record()
-            offloader.async_offload(self.layer_idx, key_states, value_states, event)
+            offloader.async_offload(self.layer_idx, key_states.transpose(1, 2), value_states.transpose(1, 2), event)
 
         #在这里增量更新KVCache
         if past_key_values is not None:

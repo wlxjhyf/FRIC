@@ -4,6 +4,18 @@ import mmap
 import threading
 import numpy as np
 import cupy as cp
+import time
+import queue
+
+current_path = os.path.dirname(os.path.abspath(__file__))
+
+from torch.utils.cpp_extension import load
+fric = load(
+    name="fric_d2h_memcpy_async",
+    sources=[f"{current_path}/../cuda/fric_memcpy.cpp"],
+    verbose=True,
+    with_cuda=True,
+)
 
 '''
 PURE_INF: only inference without kv offload
@@ -11,12 +23,13 @@ USER_SPACE: kv offload to user space memory (pinned memory)
 MMAP:
 PWRITE:
 '''
-EXP_TYPE = os.environ.get("FRIC_EXP", "PURE_INF")
+EXP_TYPE = os.environ.get("FRIC_EXP", "USER_SPACE")
 
 if EXP_TYPE == "PWRITE":
     FILE_NAME = '/mnt/data/xujiahao/beaver/moudels/register_pm/mnt/fric_save.bin'
 elif EXP_TYPE == "MMAP":
-    FILE_NAME = "/dev/dax0.0"
+    FILE_NAME = "/dev/pmem0"
+    # FILE_NAME = '/mnt/data/xujiahao/beaver/moudels/register_pm/mnt/fric_save.bin'
 
 torch_to_np = {
     torch.float32: np.float32,
@@ -40,19 +53,27 @@ class fric_offloader:
     """
     def __init__(self, max_batch_size:int = 1, max_seq_len:int = 4096, num_heads:int = 8, head_dim:int = 128, num_layers = 32, dtype = torch.float16): # Remember consindering the KVSize of prefill should multli 32 too!
         self.copy_stream = torch.cuda.Stream()
+        self.copy_event = torch.cuda.Event()
         self.num_layers = num_layers
         self.last_token_id = None
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
+        self.head_dim = head_dim
+        self.num_heads = num_heads
         
         self.offset = [0] * num_layers
         total_size = max_batch_size * num_heads * max_seq_len * head_dim * 2 * num_layers * 4 # bfloat16 = 2 bytes
+        self.flush_queue = queue.Queue()
 
         if EXP_TYPE == "USER_SPACE" or EXP_TYPE == "PWRITE":
-            self.k_buf = [torch.empty((max_batch_size, num_heads, max_seq_len, head_dim), dtype=dtype, device='cpu', pin_memory=True) for _ in range(num_layers)]
-            self.v_buf = [torch.empty((max_batch_size, num_heads, max_seq_len, head_dim), dtype=dtype, device='cpu', pin_memory=True) for _ in range(num_layers)]
+            # self.k_buf = [torch.zeros((max_batch_size, num_heads, max_seq_len, head_dim), dtype=dtype, device='cpu', pin_memory=True) for _ in range(num_layers)]
+            # self.v_buf = [torch.zeros((max_batch_size, num_heads, max_seq_len, head_dim), dtype=dtype, device='cpu', pin_memory=True) for _ in range(num_layers)]
+            self.k_buf = [torch.zeros((max_batch_size, max_seq_len, num_heads, head_dim), dtype=dtype, device='cpu', pin_memory=True) for _ in range(num_layers)]
+            self.v_buf = [torch.zeros((max_batch_size, max_seq_len, num_heads, head_dim), dtype=dtype, device='cpu', pin_memory=True) for _ in range(num_layers)]
         
         if EXP_TYPE == "PWRITE" or EXP_TYPE == "MMAP":
             self.fd = os.open(FILE_NAME, os.O_CREAT | os.O_RDWR)
-        
+            
         if EXP_TYPE == "PWRITE":
             os.ftruncate(self.fd, total_size)
 
@@ -65,7 +86,7 @@ class fric_offloader:
             for i in range(num_layers):
                 t, mm = self.__cpu_buffer_mmap(
                     file_size = max_batch_size * num_heads * max_seq_len * head_dim * 2,   # bfloat16
-                    shape = (max_batch_size, num_heads, max_seq_len, head_dim),
+                    shape = (max_batch_size, max_seq_len, num_heads, head_dim),
                     dtype = dtype
                 )
                 self.k_buf.append(t)
@@ -73,19 +94,18 @@ class fric_offloader:
 
                 t, mm = self.__cpu_buffer_mmap(
                     file_size = max_batch_size * num_heads * max_seq_len * head_dim * 2,   # bfloat16
-                    shape = (max_batch_size, num_heads, max_seq_len, head_dim),
+                    shape = (max_batch_size, max_seq_len, num_heads, head_dim),
                     dtype = dtype
                 )
                 self.v_buf.append(t)
                 self.v_mmap_handles.append(mm)
             
-        self.test_bytes = torch.randn((max_batch_size, num_heads, 132, head_dim), dtype=dtype, device='cpu').numpy().tobytes()
+            self.__start_wait_copy_event_worker()
 
     def __cpu_buffer_mmap(self, file_size, shape, dtype=torch.float16):
-        mm = mmap.mmap(self.fd, file_size, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        mm = mmap.mmap(self.fd, file_size, prot=mmap.PROT_READ | mmap.PROT_WRITE, flags=mmap.MAP_SHARED)
         np_dtype = torch_to_np[dtype]
         ptr = np.frombuffer(mm, dtype=np_dtype)
-
         address = ptr.ctypes.data
         size_bytes = ptr.nbytes
         cp.cuda.runtime.hostRegister(address, size_bytes, 0x02)
@@ -93,16 +113,56 @@ class fric_offloader:
         return t, mm
         
 
-    def write_kv_to_pagecache(self, k_buf, v_buf, offset_k, offset_v):
-        k_bytes = k_buf.numpy().tobytes()
-        v_bytes = v_buf.numpy().tobytes()
-        # k_bytes =  self.test_bytes
-        # v_bytes =  self.test_bytes
+    def write_kv_to_pagecache(self, layer_idx, offset, k_buf, v_buf):
+        elem = k_buf.element_size()
+        B, T, H, D = k_buf.shape
 
-        os.pwrite(self.fd, k_bytes, offset_k)
-        os.pwrite(self.fd, v_bytes, offset_v)
+        kv_stride = self.max_batch_size * self.max_seq_len * H * D * elem
+        layer_base = layer_idx * kv_stride * 2
 
-        
+        k_off = layer_base + offset * self.max_batch_size * H * D * elem
+        v_off = layer_base + kv_stride + offset * self.max_batch_size * H * D * elem
+
+        os.pwrite(self.fd, k_buf.detach().numpy().tobytes(), k_off)
+        os.pwrite(self.fd, v_buf.detach().numpy().tobytes(), v_off)
+
+        os.fdatasync(self.fd)
+
+    def __flush_worker(self):
+        while(True):
+            item = self.flush_queue.get()
+            if item is None:
+                break
+            # layer_idx, offset, T = item
+            layer_idx, offset, T, k_buf, v_buf = item
+            
+            elem = self.k_buf[layer_idx].element_size()
+            byte_offset = self.max_batch_size * offset * self.head_dim * self.num_heads * elem
+            byte_size = self.max_batch_size * T * self.head_dim * self.num_heads * elem
+
+            elem = k_buf.element_size()
+            B, T, H, D = k_buf.shape
+
+            kv_stride = self.max_batch_size * self.max_seq_len * H * D * elem
+            layer_base = layer_idx * kv_stride * 2
+
+            k_off = layer_base + offset * self.max_batch_size * H * D * elem
+            v_off = layer_base + kv_stride + offset * self.max_batch_size * H * D * elem
+
+            self.copy_event.synchronize()
+
+            os.pwrite(self.fd, k_buf.detach().numpy().tobytes(), k_off)
+            os.pwrite(self.fd, v_buf.detach().numpy().tobytes(), v_off)
+            os.fdatasync(self.fd)
+
+            # self.k_mmap_handles[layer_idx].flush(byte_offset, byte_size)
+            # self.v_mmap_handles[layer_idx].flush(byte_offset, byte_size)
+
+
+
+    def __start_wait_copy_event_worker(self):
+        thread = threading.Thread(target=self.__flush_worker, daemon=True)
+        thread.start()
 
     def async_offload(self, layer_idx, k:torch.tensor, v:torch.tensor, event:torch.cuda.Event = None):
         """
@@ -119,20 +179,41 @@ class fric_offloader:
         if k is None or v is None:
             return None, None
         
-        B, H, T, D = k.shape
+        # B, H, T, D = k.shape
+        B, T, H, D = k.shape
         offset = self.offset[layer_idx]
-        assert v.shape == (B, H, T, D)
-        assert offset + T <= self.k_buf[layer_idx].shape[2], "FRIC:KVBuffer overflow!"
+        assert v.shape == (B, T, H, D)
+        assert offset + T <= self.k_buf[layer_idx].shape[1], "FRIC:KVBuffer overflow!"
+
+        
+        # print(f"k is contiguous? {k.is_contiguous()}")
+        # print(f"v is contiguous? {v.is_contiguous()}")
+        # print(f"k stride is {k.stride()}")
+        # print(f"v stride is {v.stride()}")
+        # print("------------------------------")
 
         with torch.cuda.stream(self.copy_stream):
             self.copy_stream.wait_event(event)
-            k_buf = self.k_buf[layer_idx][:B, :H, offset:offset+T, :]
-            v_buf = self.v_buf[layer_idx][:B, :H, offset:offset+T, :]
-            k_buf = k.to(k_buf, non_blocking=True)
-            v_buf = v.to(v_buf, non_blocking=True)
+            k_buf = self.k_buf[layer_idx][:B, offset:offset+T, :,  :]
+            v_buf = self.v_buf[layer_idx][:B, offset:offset+T, :,  :]
+            # print(f"k_buf is contiguous? {k_buf.is_contiguous()}")
+            # print(f"v_buf is contiguous? {v_buf.is_contiguous()}")
+            # print("------------------------------")
+            k_buf.copy_(k, non_blocking=True)
+            v_buf.copy_(v, non_blocking=True)
+
+            # self.k_mmap_handles[layer_idx].flush()
+            # self.k_mmap_handles[layer_idx].flush()
+            # fric.fric_d2h_memcpy_async(k_buf, k)
+            # fric.fric_d2h_memcpy_async(v_buf, v)
+        
+        if EXP_TYPE == "MMAP":
+            self.copy_event.record(self.copy_stream)
+            # self.flush_queue.put((layer_idx, offset, T))
+            self.flush_queue.put((layer_idx, offset, T, k_buf, v_buf))
         
         if EXP_TYPE == "PWRITE":
-            self.write_kv_to_pagecache(k_buf, v_buf, 0, 0)
+            self.write_kv_to_pagecache(layer_idx, offset, k_buf, v_buf)
 
         self.offset[layer_idx] += T
         return k_buf, v_buf
