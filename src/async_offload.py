@@ -133,31 +133,16 @@ class fric_offloader:
             item = self.flush_queue.get()
             if item is None:
                 break
-            # layer_idx, offset, T = item
-            layer_idx, offset, T, k_buf, v_buf = item
+            layer_idx, offset, T = item
             
             elem = self.k_buf[layer_idx].element_size()
             byte_offset = self.max_batch_size * offset * self.head_dim * self.num_heads * elem
             byte_size = self.max_batch_size * T * self.head_dim * self.num_heads * elem
 
-            elem = k_buf.element_size()
-            B, T, H, D = k_buf.shape
-
-            kv_stride = self.max_batch_size * self.max_seq_len * H * D * elem
-            layer_base = layer_idx * kv_stride * 2
-
-            k_off = layer_base + offset * self.max_batch_size * H * D * elem
-            v_off = layer_base + kv_stride + offset * self.max_batch_size * H * D * elem
-
             self.copy_event.synchronize()
 
-            os.pwrite(self.fd, k_buf.detach().numpy().tobytes(), k_off)
-            os.pwrite(self.fd, v_buf.detach().numpy().tobytes(), v_off)
-            os.fdatasync(self.fd)
-
-            # self.k_mmap_handles[layer_idx].flush(byte_offset, byte_size)
-            # self.v_mmap_handles[layer_idx].flush(byte_offset, byte_size)
-
+            self.k_mmap_handles[layer_idx].flush(byte_offset, byte_size)
+            self.v_mmap_handles[layer_idx].flush(byte_offset, byte_size)
 
 
     def __start_wait_copy_event_worker(self):
@@ -209,8 +194,7 @@ class fric_offloader:
         
         if EXP_TYPE == "MMAP":
             self.copy_event.record(self.copy_stream)
-            # self.flush_queue.put((layer_idx, offset, T))
-            self.flush_queue.put((layer_idx, offset, T, k_buf, v_buf))
+            self.flush_queue.put((layer_idx, offset, T))
         
         if EXP_TYPE == "PWRITE":
             self.write_kv_to_pagecache(layer_idx, offset, k_buf, v_buf)
