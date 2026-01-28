@@ -83,9 +83,14 @@ class fric_offloader:
             self.v_buf = []
             self.v_mmap_handles = []
 
+            kv_bytes_per_layer = max_batch_size * num_heads * max_seq_len * head_dim * 2  # fp16
+
             for i in range(num_layers):
+                base = i * kv_bytes_per_layer * 2
+
                 t, mm = self.__cpu_buffer_mmap(
-                    file_size = max_batch_size * num_heads * max_seq_len * head_dim * 2,   # bfloat16
+                    file_size = kv_bytes_per_layer,
+                    file_offset=base,
                     shape = (max_batch_size, max_seq_len, num_heads, head_dim),
                     dtype = dtype
                 )
@@ -93,17 +98,18 @@ class fric_offloader:
                 self.k_mmap_handles.append(mm)
 
                 t, mm = self.__cpu_buffer_mmap(
-                    file_size = max_batch_size * num_heads * max_seq_len * head_dim * 2,   # bfloat16
+                    file_size = kv_bytes_per_layer,
+                    file_offset=base + kv_bytes_per_layer,
                     shape = (max_batch_size, max_seq_len, num_heads, head_dim),
                     dtype = dtype
                 )
                 self.v_buf.append(t)
                 self.v_mmap_handles.append(mm)
             
-            self.__start_wait_copy_event_worker()
+            # self.__start_wait_copy_event_worker()
 
-    def __cpu_buffer_mmap(self, file_size, shape, dtype=torch.float16):
-        mm = mmap.mmap(self.fd, file_size, prot=mmap.PROT_READ | mmap.PROT_WRITE, flags=mmap.MAP_SHARED)
+    def __cpu_buffer_mmap(self, file_size, file_offset, shape, dtype=torch.float16):
+        mm = mmap.mmap(self.fd, file_size, offset = file_offset, prot=mmap.PROT_READ | mmap.PROT_WRITE, flags=mmap.MAP_SHARED)
         np_dtype = torch_to_np[dtype]
         ptr = np.frombuffer(mm, dtype=np_dtype)
         address = ptr.ctypes.data
@@ -187,8 +193,6 @@ class fric_offloader:
             k_buf.copy_(k, non_blocking=True)
             v_buf.copy_(v, non_blocking=True)
 
-            # self.k_mmap_handles[layer_idx].flush()
-            # self.k_mmap_handles[layer_idx].flush()
             # fric.fric_d2h_memcpy_async(k_buf, k)
             # fric.fric_d2h_memcpy_async(v_buf, v)
         
@@ -208,17 +212,18 @@ class fric_offloader:
         TODO: 1. Now the implementation is just restore from the DRAM.
               2. Need to implement async restore which makes each layer inference async after load their KV.
         """
-        B, H, T, D = self.k_buf[layer_idx].shape 
+        B, T, H, D = self.k_buf[layer_idx].shape 
 
-        k_buf = self.k_buf[layer_idx][:, :, :self.offset[layer_idx], :]
-        v_buf = self.v_buf[layer_idx][:, :, :self.offset[layer_idx], :]
-        k = k_buf.to('cuda', non_blocking=False)
-        v = v_buf.to('cuda', non_blocking=False)
+        k_buf = self.k_buf[layer_idx][:, :self.offset[layer_idx], :, :]
+        v_buf = self.v_buf[layer_idx][:, :self.offset[layer_idx], :, :]
+        print(k_buf.device)
+        k = k_buf.to('cuda', non_blocking=False).transpose(1, 2)
+        v = v_buf.to('cuda', non_blocking=False).transpose(1, 2)
         return k, v
 
 
     
-    def sync_restore_each_layer_cpu(self, layer_idx, dtype=torch.float32):
+    def sync_restore_each_layer_cpu(self, layer_idx, dtype=torch.float16):
         k = self.k_buf[layer_idx][:, :, :self.offset[layer_idx], :].to(dtype=dtype)
         v = self.v_buf[layer_idx][:, :, :self.offset[layer_idx], :].to(dtype=dtype)
         return k, v
